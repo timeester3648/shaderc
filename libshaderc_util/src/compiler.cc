@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -30,6 +31,94 @@
 #include "libshaderc_util/string_piece.h"
 #include "libshaderc_util/version_profile.h"
 #include "spirv-tools/libspirv.hpp"
+
+#include "glslang/Include/Common.h"
+#include "glslang/Include/InfoSink.h"
+#include "glslang/Include/Types.h"
+
+#include "glslang/MachineIndependent/iomapper.h"
+#include "glslang/MachineIndependent/LiveTraverser.h"
+#include "glslang/MachineIndependent/SymbolTable.h"
+
+namespace glslang {
+ // Note: until they make it public, so also need to keep definition in sync
+struct TVarEntryInfo {
+  long long id;
+  TIntermSymbol* symbol;
+  bool live;
+  TLayoutPacking
+      upgradedToPushConstantPacking;  // ElpNone means it hasn't been upgraded
+  int newBinding;
+  int newSet;
+  int newLocation;
+  int newComponent;
+  int newIndex;
+  EShLanguage stage;
+
+  void clearNewAssignments() {
+    upgradedToPushConstantPacking = ElpNone;
+    newBinding = -1;
+    newSet = -1;
+    newLocation = -1;
+    newComponent = -1;
+    newIndex = -1;
+  }
+
+  struct TOrderById {
+    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
+      return l.id < r.id;
+    }
+  };
+
+  struct TOrderByPriority {
+    // ordering:
+    // 1) has both binding and set
+    // 2) has binding but no set
+    // 3) has no binding but set
+    // 4) has no binding and no set
+    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
+      const TQualifier& lq = l.symbol->getQualifier();
+      const TQualifier& rq = r.symbol->getQualifier();
+
+      // simple rules:
+      // has binding gives 2 points
+      // has set gives 1 point
+      // who has the most points is more important.
+      int lPoints = (lq.hasBinding() ? 2 : 0) + (lq.hasSet() ? 1 : 0);
+      int rPoints = (rq.hasBinding() ? 2 : 0) + (rq.hasSet() ? 1 : 0);
+
+      if (lPoints == rPoints) return l.id < r.id;
+      return lPoints > rPoints;
+    }
+  };
+
+  struct TOrderByPriorityAndLive {
+    // ordering:
+    // 1) do live variables first
+    // 2) has both binding and set
+    // 3) has binding but no set
+    // 4) has no binding but set
+    // 5) has no binding and no set
+    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
+      const TQualifier& lq = l.symbol->getQualifier();
+      const TQualifier& rq = r.symbol->getQualifier();
+
+      // simple rules:
+      // has binding gives 2 points
+      // has set gives 1 point
+      // who has the most points is more important.
+      int lPoints = (lq.hasBinding() ? 2 : 0) + (lq.hasSet() ? 1 : 0);
+      int rPoints = (rq.hasBinding() ? 2 : 0) + (rq.hasSet() ? 1 : 0);
+
+      if (l.live != r.live) return l.live > r.live;
+
+      if (lPoints != rPoints) return lPoints > rPoints;
+
+      return l.id < r.id;
+    }
+  };
+};
+}
 
 namespace {
 using shaderc_util::string_piece;
@@ -108,6 +197,98 @@ EShMessages GetMessageRules(shaderc_util::Compiler::TargetEnv env,
   }
   return result;
 }
+
+// Custom binding/set resolver used when auto-map-locations is enabled.
+//
+// Rules:
+//  * set + binding both explicit -> kept as-is
+//  * set only                    -> first free binding *within that set*
+//  * binding only                -> lands in the first set index that has
+//                                    no explicit `set` anywhere in the
+//                                    shader, using the given binding value
+//  * neither                     -> same "first undeclared set" as above,
+//                                    using the first free binding in it
+class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
+ public:
+  explicit ShadercAutoBindResolver(const glslang::TIntermediate& intermediate)
+      : glslang::TDefaultIoResolverBase(intermediate) {}
+
+  bool validateBinding(EShLanguage, glslang::TVarEntryInfo&) override {
+    return true;
+  }
+
+  glslang::TResourceType getResourceType(const glslang::TType& type) override {
+    if (isImageType(type)) return glslang::EResImage;
+    if (isTextureType(type)) return glslang::EResTexture;
+    if (isSsboType(type)) return glslang::EResSsbo;
+    if (isSamplerType(type)) return glslang::EResSampler;
+    if (isUboType(type)) return glslang::EResUbo;
+    if (isCombinedSamplerType(type)) return glslang::EResCombinedSampler;
+    if (isAsType(type)) return glslang::EResAs;
+    if (isTensorType(type)) return glslang::EResTensor;
+    return glslang::EResCount;
+  }
+
+  // notifyBinding() runs for every uniform/UBO/SSBO/opaque variable before
+  // any set/binding is actually resolved, so this is where we learn which
+  // set indices were explicitly used anywhere in the shader.
+  void notifyBinding(EShLanguage, glslang::TVarEntryInfo& ent) override {
+    const glslang::TType& type = ent.symbol->getType();
+    if (type.getQualifier().hasSet()) {
+      explicit_sets_.insert(type.getQualifier().layoutSet);
+    }
+  }
+
+  void endNotifications(EShLanguage) override {
+    int candidate = 0;
+    while (explicit_sets_.count(candidate)) ++candidate;
+    catch_all_set_ = candidate;
+  }
+
+  int resolveSet(EShLanguage, glslang::TVarEntryInfo& ent) override {
+    const glslang::TType& type = ent.symbol->getType();
+    if (type.getQualifier().hasSet()) {
+      return ent.newSet = type.getQualifier().layoutSet;
+    }
+    // No explicit set: goes into the first set index nothing else claimed.
+    return ent.newSet = catch_all_set_;
+  }
+
+  int resolveBinding(EShLanguage stage, glslang::TVarEntryInfo& ent) override {
+    const glslang::TType& type = ent.symbol->getType();
+    glslang::TResourceType resource = getResourceType(type);
+    if (resource >= glslang::EResCount) return ent.newBinding = -1;
+
+    const int set = ent.newSet;  // resolveSet() has already run by this point
+    const int numBindings =
+        type.isSizedArray() ? type.getCumulativeArraySize() : 1;
+    const int resourceKey =
+        referenceIntermediate.getBindingsPerResourceType() ? resource : 0;
+
+    if (type.getQualifier().hasBinding()) {
+      // Explicit binding: reserve exactly that slot (whether or not the
+      // set was also explicit -- covers both "set+binding" and
+      // "binding only" cases).
+      return ent.newBinding = reserveSlot(resourceKey, set,
+                                          getBaseBinding(stage, resource, set) +
+                                              type.getQualifier().layoutBinding,
+                                          numBindings);
+    }
+    if (!ent.live || !doAutoBindingMapping()) {
+      return ent.newBinding = -1;
+    }
+    // No explicit binding: fill the first free hole within the set
+    // (covers "set only" and "neither" cases).
+    return ent.newBinding =
+               getFreeSlot(resourceKey, set,
+                           getBaseBinding(stage, resource, set), numBindings);
+  }
+
+ private:
+  std::set<int> explicit_sets_;
+  int catch_all_set_ = 0;
+};
+
 
 }  // anonymous namespace
 
@@ -352,7 +533,16 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
 
   glslang::TProgram program;
   program.addShader(&shader);
-  success = program.link(EShMsgDefault) && program.mapIO();
+  success = program.link(EShMsgDefault);
+  if (success) {
+    if (auto_map_locations_) {
+      ShadercAutoBindResolver io_resolver(*shader.getIntermediate());
+      success = program.mapIO(&io_resolver);
+    } else {
+      success = program.mapIO();
+    }
+  }
+
   success &= PrintFilteredErrors(error_tag, error_stream, warnings_as_errors_,
                                  suppress_warnings_, program.getInfoLog(),
                                  total_warnings, total_errors);
