@@ -14,12 +14,15 @@
 
 #include "libshaderc_util/compiler.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iomanip>
+#include <map>
 #include <set>
 #include <sstream>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #include "SPIRV/GlslangToSpv.h"
 #include "libshaderc_util/format.h"
@@ -35,6 +38,7 @@
 #include "glslang/Include/Common.h"
 #include "glslang/Include/InfoSink.h"
 #include "glslang/Include/Types.h"
+#include "glslang/Include/intermediate.h" 
 
 #include "glslang/MachineIndependent/iomapper.h"
 #include "glslang/MachineIndependent/LiveTraverser.h"
@@ -198,20 +202,111 @@ EShMessages GetMessageRules(shaderc_util::Compiler::TargetEnv env,
   return result;
 }
 
+// Walks the whole tree (live + dead code) collecting every uniform/buffer
+// resource declaration exactly once, regardless of traversal order.
+class UniformResourceCollector : public glslang::TIntermTraverser {
+ public:
+  struct Entry {
+    glslang::TString name;
+    const glslang::TType* type;
+    bool hasSet;
+    int set;
+    bool hasBinding;
+    int binding;
+  };
+
+  void visitSymbol(glslang::TIntermSymbol* symbol) override {
+    const glslang::TQualifier& q = symbol->getQualifier();
+    if (!q.isUniformOrBuffer() || q.isPushConstant() || q.isShaderRecord())
+      return;
+    const glslang::TString& name = symbol->getAccessName();
+    if (!seen_.insert(name).second) return;  // same resource seen before
+
+    Entry e;
+    e.name = name;
+    e.type = &symbol->getType();
+    e.hasSet = q.hasSet();
+    e.set = e.hasSet ? q.layoutSet : 0;
+    e.hasBinding = q.hasBinding();
+    e.binding = e.hasBinding ? q.layoutBinding : 0;
+    entries.push_back(e);
+  }
+
+  std::vector<Entry> entries;
+
+ private:
+  std::set<glslang::TString> seen_;
+};
+
 // Custom binding/set resolver used when auto-map-locations is enabled.
 //
 // Rules:
 //  * set + binding both explicit -> kept as-is
 //  * set only                    -> first free binding *within that set*
-//  * binding only                -> lands in the first set index that has
-//                                    no explicit `set` anywhere in the
-//                                    shader, using the given binding value
-//  * neither                     -> same "first undeclared set" as above,
-//                                    using the first free binding in it
+//  * binding only                -> lands in the first set index with no
+//                                    explicit `set` anywhere in the shader
+//  * neither                     -> same "first undeclared set", first
+//                                    free binding in it
+//
+// Everything is precomputed once in the constructor from a name-sorted
+// (then resource-type-sorted) list of declarations, so the result is
+// completely independent of declaration/include order.
 class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
  public:
   explicit ShadercAutoBindResolver(const glslang::TIntermediate& intermediate)
-      : glslang::TDefaultIoResolverBase(intermediate) {}
+      : glslang::TDefaultIoResolverBase(intermediate) {
+    UniformResourceCollector collector;
+    TIntermNode* root = intermediate.getTreeRoot();
+    if (root) root->traverse(&collector);
+
+    // Deterministic order: name first, resource type as tiebreak.
+    std::sort(collector.entries.begin(), collector.entries.end(),
+              [this](const UniformResourceCollector::Entry& a,
+                     const UniformResourceCollector::Entry& b) {
+                if (a.name != b.name) return a.name < b.name;
+                return getResourceType(*a.type) < getResourceType(*b.type);
+              });
+
+    // Pass 1: find every explicitly-declared set -> pick the catch-all.
+    for (const auto& e : collector.entries) {
+      if (e.hasSet) explicit_sets_.insert(e.set);
+    }
+    int candidate = 0;
+    while (explicit_sets_.count(candidate)) ++candidate;
+    catch_all_set_ = candidate;
+
+    const EShLanguage stage = intermediate.getStage();
+
+    // Pass 2: reserve everything with an explicit binding first (both the
+    // "set+binding" and "binding only" cases), exactly as written.
+    for (const auto& e : collector.entries) {
+      if (!e.hasBinding) continue;
+      const int set = e.hasSet ? e.set : catch_all_set_;
+      const glslang::TResourceType resource = getResourceType(*e.type);
+      const int resourceKey =
+          referenceIntermediate.getBindingsPerResourceType() ? resource : 0;
+      const int numBindings =
+          e.type->isSizedArray() ? e.type->getCumulativeArraySize() : 1;
+      const int binding = getBaseBinding(stage, resource, set) + e.binding;
+      resolved_[e.name] = {set, binding};
+      reserveSlot(resourceKey, set, binding, numBindings);
+    }
+
+    // Pass 3: fill "set only" / "neither" into the first free hole, in the
+    // deterministic name-sorted order above.
+    for (const auto& e : collector.entries) {
+      if (e.hasBinding) continue;
+      const int set = e.hasSet ? e.set : catch_all_set_;
+      const glslang::TResourceType resource = getResourceType(*e.type);
+      const int resourceKey =
+          referenceIntermediate.getBindingsPerResourceType() ? resource : 0;
+      const int numBindings =
+          e.type->isSizedArray() ? e.type->getCumulativeArraySize() : 1;
+      const int base = getBaseBinding(stage, resource, set);
+      const int binding = getFreeSlot(resourceKey, set, base, numBindings);
+      resolved_[e.name] = {set, binding};
+    }
+  }
 
   bool validateBinding(EShLanguage, glslang::TVarEntryInfo&) override {
     return true;
@@ -229,64 +324,29 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
     return glslang::EResCount;
   }
 
-  // notifyBinding() runs for every uniform/UBO/SSBO/opaque variable before
-  // any set/binding is actually resolved, so this is where we learn which
-  // set indices were explicitly used anywhere in the shader.
-  void notifyBinding(EShLanguage, glslang::TVarEntryInfo& ent) override {
-    const glslang::TType& type = ent.symbol->getType();
-    if (type.getQualifier().hasSet()) {
-      explicit_sets_.insert(type.getQualifier().layoutSet);
-    }
-  }
-
-  void endNotifications(EShLanguage) override {
-    int candidate = 0;
-    while (explicit_sets_.count(candidate)) ++candidate;
-    catch_all_set_ = candidate;
-  }
-
   int resolveSet(EShLanguage, glslang::TVarEntryInfo& ent) override {
-    const glslang::TType& type = ent.symbol->getType();
-    if (type.getQualifier().hasSet()) {
-      return ent.newSet = type.getQualifier().layoutSet;
-    }
-    // No explicit set: goes into the first set index nothing else claimed.
-    return ent.newSet = catch_all_set_;
+    auto it = resolved_.find(ent.symbol->getAccessName());
+    return ent.newSet = (it == resolved_.end() ? 0 : it->second.first);
   }
 
-  int resolveBinding(EShLanguage stage, glslang::TVarEntryInfo& ent) override {
+  int resolveBinding(EShLanguage, glslang::TVarEntryInfo& ent) override {
+    auto it = resolved_.find(ent.symbol->getAccessName());
+    if (it == resolved_.end()) return ent.newBinding = -1;
+
     const glslang::TType& type = ent.symbol->getType();
-    glslang::TResourceType resource = getResourceType(type);
-    if (resource >= glslang::EResCount) return ent.newBinding = -1;
-
-    const int set = ent.newSet;  // resolveSet() has already run by this point
-    const int numBindings =
-        type.isSizedArray() ? type.getCumulativeArraySize() : 1;
-    const int resourceKey =
-        referenceIntermediate.getBindingsPerResourceType() ? resource : 0;
-
     if (type.getQualifier().hasBinding()) {
-      // Explicit binding: reserve exactly that slot (whether or not the
-      // set was also explicit -- covers both "set+binding" and
-      // "binding only" cases).
-      return ent.newBinding = reserveSlot(resourceKey, set,
-                                          getBaseBinding(stage, resource, set) +
-                                              type.getQualifier().layoutBinding,
-                                          numBindings);
+      return ent.newBinding = it->second.second;  // explicit: always applied
     }
     if (!ent.live || !doAutoBindingMapping()) {
       return ent.newBinding = -1;
     }
-    // No explicit binding: fill the first free hole within the set
-    // (covers "set only" and "neither" cases).
-    return ent.newBinding =
-               getFreeSlot(resourceKey, set,
-                           getBaseBinding(stage, resource, set), numBindings);
+    return ent.newBinding = it->second.second;
   }
 
  private:
   std::set<int> explicit_sets_;
   int catch_all_set_ = 0;
+  std::map<glslang::TString, std::pair<int, int>> resolved_;
 };
 
 
