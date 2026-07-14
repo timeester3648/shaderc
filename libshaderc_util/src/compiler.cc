@@ -528,6 +528,7 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   shader.setStringsWithLengthsAndNames(&shader_strings, &shader_lengths,
                                        &string_names, 1);
   shader.setPreamble(preamble.c_str());
+  shader.setSourceEntryPoint("main");
   shader.setEntryPoint(entry_point_name);
   shader.setAutoMapBindings(auto_bind_uniforms_);
   if (auto_combined_image_sampler_) {
