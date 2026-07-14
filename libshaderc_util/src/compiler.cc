@@ -595,7 +595,7 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   program.addShader(&shader);
   success = program.link(EShMsgDefault);
   if (success) {
-    if (auto_map_locations_) {
+    if (auto_bind_uniforms_) {
       ShadercAutoBindResolver io_resolver(*shader.getIntermediate());
       success = program.mapIO(&io_resolver);
     } else {
