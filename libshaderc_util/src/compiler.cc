@@ -795,19 +795,19 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
                                  total_warnings, total_errors);
   if (!success) return result_tuple;
 
+  GlobalUniformBlockOptimizer block_optimizer(*shader.getIntermediate());
+  if (auto root = shader.getIntermediate()->getTreeRoot()) {
+    root->traverse(&block_optimizer);
+
+    GlobalUniformBlockIndexRemapper index_remapper(block_optimizer.indexMap());
+    root->traverse(&index_remapper);
+  }
+
   glslang::TProgram program;
   program.addShader(&shader);
   success = program.link(EShMsgDefault);
   if (success) {
     if (auto_bind_uniforms_) {
-      GlobalUniformBlockOptimizer block_optimizer(*shader.getIntermediate());
-      if (auto root = shader.getIntermediate()->getTreeRoot()) {
-        root->traverse(&block_optimizer);
-
-        GlobalUniformBlockIndexRemapper index_remapper(block_optimizer.indexMap());
-        root->traverse(&index_remapper);
-      }
-
       ShadercAutoBindResolver io_resolver(*shader.getIntermediate());
       success = program.mapIO(&io_resolver);
     } else {
