@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
 
   // What kind of uniform variable are we setting the binding base for?
   shaderc_uniform_kind u_kind = shaderc_uniform_kind_buffer;
-
+  compiler.options().SetVulkanRulesRelaxed(true);
   // Sets binding base for the given uniform kind.  If stage is
   // shader_glsl_infer_from_source then set it for all shader stages.
   auto set_binding_base = [&compiler](shaderc_shader_kind stage,

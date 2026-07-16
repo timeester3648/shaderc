@@ -44,6 +44,8 @@
 #include "glslang/MachineIndependent/LiveTraverser.h"
 #include "glslang/MachineIndependent/SymbolTable.h"
 
+#include "../../libshaderc/include/shaderc/shaderc_ext.h"
+
 namespace glslang {
  // Note: until they make it public, so also need to keep definition in sync
 struct TVarEntryInfo {
@@ -202,6 +204,193 @@ EShMessages GetMessageRules(shaderc_util::Compiler::TargetEnv env,
   return result;
 }
 
+// Forces the shaderc-generated default (global) uniform block to std430
+// packing and reorders its members to minimize padding.
+//
+// Algorithm (greedy best-fit bin packing):
+//  1. Compute each field's (alignment, size) under std430 rules via
+//     TIntermediate::getBaseAlignment.
+//  2. Process fields from largest alignment to smallest (ties: larger size
+//     first, then name, for determinism). Largest-alignment fields go first
+//     since they have zero packing flexibility anyway -- they must sit at a
+//     multiple of their own alignment and nothing can be done to shrink that.
+//  3. For each field, look for the smallest already-open padding gap it fits
+//     in (best-fit, so bigger gaps stay available for bigger later fields).
+//     If none fits, append it at the current end of the block, which may
+//     itself open a new gap due to alignment rounding.
+//  4. The final member order is the order fields ended up placed at
+//     (by offset), which is what actually determines the padding once
+//     glslang assigns real offsets sequentially over this reordered list.
+class GlobalUniformBlockOptimizer : public glslang::TIntermTraverser {
+ public:
+  explicit GlobalUniformBlockOptimizer(const glslang::TIntermediate& intermediate)
+      : intermediate_(intermediate) {}
+
+  void visitSymbol(glslang::TIntermSymbol* symbol) override {
+    if (symbol->getAccessName() != SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME) {
+      return;
+    }
+
+    glslang::TType& blockType = symbol->getWritableType();
+    blockType.getQualifier().layoutPacking = glslang::ElpStd430;
+
+    auto fields = blockType.getWritableStruct();
+    if (!fields || fields->size() < 2) return;
+
+    if (!already_reordered_) {
+      Repack(*fields);
+      already_reordered_ = true;
+    }
+
+    fields->clear();
+    for (const auto& loc : reordered_) fields->push_back(loc);
+  }
+
+  // old-declaration-index -> new-index, valid once the full tree has been
+  // traversed at least once (i.e. after root->traverse(&optimizer) returns).
+  const std::vector<int>& indexMap() const { return old_to_new_; }
+
+ private:
+  struct Candidate {
+    const glslang::TTypeLoc* loc;
+    int alignment;
+    int size;
+    int original_index;
+  };
+
+  struct Gap {
+    int offset;
+    int size;
+  };
+
+  void Repack(const glslang::TTypeList& original) {
+    std::vector<Candidate> candidates;
+    candidates.reserve(original.size());
+    for (size_t i = 0; i < original.size(); ++i) {
+      int size = 0;
+      int stride = 0;
+      const int alignment = intermediate_.getBaseAlignment(
+          *original[i].type, size, stride, glslang::ElpStd430,
+          /*rowMajor=*/false);
+      candidates.push_back({&original[i], alignment, size, static_cast<int>(i)});
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) {
+                if (a.alignment != b.alignment) return a.alignment > b.alignment;
+                if (a.size != b.size) return a.size > b.size;
+                return a.loc->type->getFieldName() < b.loc->type->getFieldName();
+              });
+
+    std::vector<Gap> gaps;
+    struct Placed {
+      int offset;
+      const glslang::TTypeLoc* loc;
+      int original_index;
+    };
+    std::vector<Placed> placed;
+    placed.reserve(candidates.size());
+    int cursor = 0;
+
+    for (const Candidate& field : candidates) {
+      int best_gap = -1;
+      int best_gap_aligned_start = 0;
+      for (size_t i = 0; i < gaps.size(); ++i) {
+        const int aligned_start =
+            (gaps[i].offset + field.alignment - 1) / field.alignment *
+            field.alignment;
+        const int gap_end = gaps[i].offset + gaps[i].size;
+        if (aligned_start + field.size > gap_end) continue;
+        if (best_gap == -1 || gaps[i].size < gaps[best_gap].size) {
+          best_gap = static_cast<int>(i);
+          best_gap_aligned_start = aligned_start;
+        }
+      }
+
+      int placement_offset;
+      if (best_gap != -1) {
+        const Gap gap = gaps[best_gap];
+        gaps.erase(gaps.begin() + best_gap);
+        placement_offset = best_gap_aligned_start;
+
+        const int leading = best_gap_aligned_start - gap.offset;
+        const int trailing =
+            (gap.offset + gap.size) - (best_gap_aligned_start + field.size);
+        if (leading > 0) gaps.push_back({gap.offset, leading});
+        if (trailing > 0)
+          gaps.push_back({best_gap_aligned_start + field.size, trailing});
+      } else {
+        const int aligned_start =
+            (cursor + field.alignment - 1) / field.alignment * field.alignment;
+        if (aligned_start > cursor)
+          gaps.push_back({cursor, aligned_start - cursor});
+        placement_offset = aligned_start;
+        cursor = aligned_start + field.size;
+      }
+
+      placed.push_back({placement_offset, field.loc, field.original_index});
+    }
+
+    std::sort(placed.begin(), placed.end(),
+              [](const Placed& a, const Placed& b) { return a.offset < b.offset; });
+
+    reordered_.clear();
+    reordered_.reserve(placed.size());
+    old_to_new_.assign(placed.size(), -1);
+    for (size_t new_index = 0; new_index < placed.size(); ++new_index) {
+      reordered_.push_back(*placed[new_index].loc);
+      old_to_new_[placed[new_index].original_index] = static_cast<int>(new_index);
+    }
+  }
+
+  bool already_reordered_ = false;
+  std::vector<glslang::TTypeLoc> reordered_;
+  std::vector<int> old_to_new_;
+  const glslang::TIntermediate& intermediate_;
+};
+
+// Second pass: rewrites every existing access into the default uniform
+// block so its baked-in member index matches the NEW post-reorder layout.
+// Required because EOpIndexDirectStruct indices are set at parse time,
+// long before GlobalUniformBlockOptimizer runs.
+class GlobalUniformBlockIndexRemapper : public glslang::TIntermTraverser {
+ public:
+  explicit GlobalUniformBlockIndexRemapper(const std::vector<int>& old_to_new)
+      : old_to_new_(old_to_new) {}
+
+  bool visitBinary(glslang::TVisit, glslang::TIntermBinary* node) override {
+    if (node->getOp() != glslang::EOpIndexDirectStruct) return true;
+
+    glslang::TIntermSymbol* leftSym = node->getLeft()->getAsSymbolNode();
+    if (!leftSym ||
+        leftSym->getAccessName() != SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME)
+      return true;
+
+    glslang::TIntermConstantUnion* idxNode = node->getRight()->getAsConstantUnion();
+    if (!idxNode) return true;
+
+    const int old_index = idxNode->getConstArray()[0].getIConst();
+    if (old_index < 0 || old_index >= static_cast<int>(old_to_new_.size()))
+      return true;
+    const int new_index = old_to_new_[old_index];
+    if (new_index == old_index) return true;
+
+    // Rebuild rather than mutate in place: getConstArray() commonly returns
+    // a const reference, so this is the portable way to change the value.
+    glslang::TConstUnionArray newArray(1);
+    newArray[0].setIConst(new_index);
+    glslang::TIntermConstantUnion* newIdx =
+        new glslang::TIntermConstantUnion(newArray, idxNode->getType());
+    newIdx->setLoc(idxNode->getLoc());
+    node->setRight(newIdx);
+
+    return true;
+  }
+
+ private:
+  const std::vector<int>& old_to_new_;
+};
+
 // Walks the whole tree (live + dead code) collecting every uniform/buffer
 // resource declaration exactly once, regardless of traversal order.
 class UniformResourceCollector : public glslang::TIntermTraverser {
@@ -222,12 +411,21 @@ class UniformResourceCollector : public glslang::TIntermTraverser {
     const glslang::TString& name = symbol->getAccessName();
     if (!seen_.insert(name).second) return;  // same resource seen before
 
+    // The shaderc-generated default (global) uniform block is only given a
+    // set/binding via Compiler::Compile's setGlobalUniformSet/Binding calls
+    // so parsing succeeds. Treat it as if neither were user-explicit so it
+    // gets folded into the normal "first unused set / first free binding"
+    // allocation below, exactly like any other resource with no explicit
+    // layout qualifiers.
+    const bool is_default_uniform_block =
+        name == SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME;
+
     Entry e;
     e.name = name;
     e.type = &symbol->getType();
-    e.hasSet = q.hasSet();
+    e.hasSet = is_default_uniform_block ? false : q.hasSet();
     e.set = e.hasSet ? q.layoutSet : 0;
-    e.hasBinding = q.hasBinding();
+    e.hasBinding = is_default_uniform_block ? false : q.hasBinding();
     e.binding = e.hasBinding ? q.layoutBinding : 0;
     entries.push_back(e);
   }
@@ -531,6 +729,11 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   shader.setSourceEntryPoint("main");
   shader.setEntryPoint(entry_point_name);
   shader.setAutoMapBindings(auto_bind_uniforms_);
+
+  shader.setGlobalUniformBlockName(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME);
+  shader.setGlobalUniformSet(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_SET);
+  shader.setGlobalUniformBinding(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_BINDING);
+  
   if (auto_combined_image_sampler_) {
     shader.setTextureSamplerTransformMode(
         EShTexSampTransUpgradeTextureRemoveSampler);
@@ -597,6 +800,14 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   success = program.link(EShMsgDefault);
   if (success) {
     if (auto_bind_uniforms_) {
+      GlobalUniformBlockOptimizer block_optimizer(*shader.getIntermediate());
+      if (auto root = shader.getIntermediate()->getTreeRoot()) {
+        root->traverse(&block_optimizer);
+
+        GlobalUniformBlockIndexRemapper index_remapper(block_optimizer.indexMap());
+        root->traverse(&index_remapper);
+      }
+
       ShadercAutoBindResolver io_resolver(*shader.getIntermediate());
       success = program.mapIO(&io_resolver);
     } else {
