@@ -46,86 +46,6 @@
 
 #include "../../libshaderc/include/shaderc/shaderc_ext.h"
 
-namespace glslang {
- // Note: until they make it public, so also need to keep definition in sync
-struct TVarEntryInfo {
-  long long id;
-  TIntermSymbol* symbol;
-  bool live;
-  TLayoutPacking
-      upgradedToPushConstantPacking;  // ElpNone means it hasn't been upgraded
-  int newBinding;
-  int newSet;
-  int newLocation;
-  int newComponent;
-  int newIndex;
-  EShLanguage stage;
-
-  void clearNewAssignments() {
-    upgradedToPushConstantPacking = ElpNone;
-    newBinding = -1;
-    newSet = -1;
-    newLocation = -1;
-    newComponent = -1;
-    newIndex = -1;
-  }
-
-  struct TOrderById {
-    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
-      return l.id < r.id;
-    }
-  };
-
-  struct TOrderByPriority {
-    // ordering:
-    // 1) has both binding and set
-    // 2) has binding but no set
-    // 3) has no binding but set
-    // 4) has no binding and no set
-    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
-      const TQualifier& lq = l.symbol->getQualifier();
-      const TQualifier& rq = r.symbol->getQualifier();
-
-      // simple rules:
-      // has binding gives 2 points
-      // has set gives 1 point
-      // who has the most points is more important.
-      int lPoints = (lq.hasBinding() ? 2 : 0) + (lq.hasSet() ? 1 : 0);
-      int rPoints = (rq.hasBinding() ? 2 : 0) + (rq.hasSet() ? 1 : 0);
-
-      if (lPoints == rPoints) return l.id < r.id;
-      return lPoints > rPoints;
-    }
-  };
-
-  struct TOrderByPriorityAndLive {
-    // ordering:
-    // 1) do live variables first
-    // 2) has both binding and set
-    // 3) has binding but no set
-    // 4) has no binding but set
-    // 5) has no binding and no set
-    inline bool operator()(const TVarEntryInfo& l, const TVarEntryInfo& r) {
-      const TQualifier& lq = l.symbol->getQualifier();
-      const TQualifier& rq = r.symbol->getQualifier();
-
-      // simple rules:
-      // has binding gives 2 points
-      // has set gives 1 point
-      // who has the most points is more important.
-      int lPoints = (lq.hasBinding() ? 2 : 0) + (lq.hasSet() ? 1 : 0);
-      int rPoints = (rq.hasBinding() ? 2 : 0) + (rq.hasSet() ? 1 : 0);
-
-      if (l.live != r.live) return l.live > r.live;
-
-      if (lPoints != rPoints) return lPoints > rPoints;
-
-      return l.id < r.id;
-    }
-  };
-};
-}
-
 namespace {
 using shaderc_util::string_piece;
 
@@ -396,7 +316,7 @@ class GlobalUniformBlockIndexRemapper : public glslang::TIntermTraverser {
 class UniformResourceCollector : public glslang::TIntermTraverser {
  public:
   struct Entry {
-    glslang::TString name;
+    glslang::TString name, extra_name;
     const glslang::TType* type;
     bool hasSet;
     int set;
@@ -422,6 +342,7 @@ class UniformResourceCollector : public glslang::TIntermTraverser {
 
     Entry e;
     e.name = name;
+    e.extra_name = symbol->getName();
     e.type = &symbol->getType();
     e.hasSet = is_default_uniform_block ? false : q.hasSet();
     e.set = e.hasSet ? q.layoutSet : 0;
@@ -487,6 +408,9 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
           e.type->isSizedArray() ? e.type->getCumulativeArraySize() : 1;
       const int binding = getBaseBinding(stage, resource, set) + e.binding;
       resolved_[e.name] = {set, binding};
+      if (e.name != e.extra_name) {
+        resolved_[e.extra_name] = {set, binding};      
+      }
       reserveSlot(resourceKey, set, binding, numBindings);
     }
 
@@ -503,6 +427,9 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
       const int base = getBaseBinding(stage, resource, set);
       const int binding = getFreeSlot(resourceKey, set, base, numBindings);
       resolved_[e.name] = {set, binding};
+      if (e.name != e.extra_name) {
+        resolved_[e.extra_name] = {set, binding};
+      }
     }
   }
 
@@ -535,7 +462,8 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
     if (type.getQualifier().hasBinding()) {
       return ent.newBinding = it->second.second;  // explicit: always applied
     }
-    if (!ent.live || !doAutoBindingMapping()) {
+    // Note: else removes binding when not used
+    if (/*!ent.live ||*/ !doAutoBindingMapping()) {
       return ent.newBinding = -1;
     }
     return ent.newBinding = it->second.second;
