@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SHADERC_SHADERC_H_
-#define SHADERC_SHADERC_H_
+#ifndef SHADERC_EXT_SHADERC_H_
+#define SHADERC_EXT_SHADERC_H_
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,4 +35,4 @@ extern "C" {
 }
 #endif  // __cplusplus
 
-#endif  // SHADERC_SHADERC_H_
+#endif  // SHADERC_EXT_SHADERC_H_
