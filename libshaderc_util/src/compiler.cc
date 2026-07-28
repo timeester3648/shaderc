@@ -322,6 +322,16 @@ class UniformResourceCollector : public glslang::TIntermTraverser {
     int set;
     bool hasBinding;
     int binding;
+    // True for the SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME /
+    // _END_NAME marker declarations themselves.
+    bool isOrderMarker = false;
+    // True for uniforms declared between the start/end markers.
+    bool isSpecialOrder = false;
+    // Id of the declaration, used ONLY to determine which
+    // uniforms fall between the SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME
+    // / _END_NAME markers. Not used for the final deterministic ordering.
+    // source loc is impacted by #line and not all symbols have it
+    long long id;
   };
 
   void visitSymbol(glslang::TIntermSymbol* symbol) override {
@@ -348,6 +358,7 @@ class UniformResourceCollector : public glslang::TIntermTraverser {
     e.set = e.hasSet ? q.layoutSet : 0;
     e.hasBinding = is_default_uniform_block ? false : q.hasBinding();
     e.binding = e.hasBinding ? q.layoutBinding : 0;
+    e.id = symbol->getId();
     entries.push_back(e);
   }
 
@@ -378,16 +389,62 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
     TIntermNode* root = intermediate.getTreeRoot();
     if (root) root->traverse(&collector);
 
-    // Deterministic order: name first, resource type as tiebreak.
+    // Locate the special-order marker range using SOURCE LOCATION, since
+    // collector.entries is explicitly in traversal order, not declaration
+    // order (dead code, functions, etc. can be visited out of sequence).
+    {
+      std::vector<const UniformResourceCollector::Entry*> by_loc;
+      by_loc.reserve(collector.entries.size());
+      for (const auto& e : collector.entries) by_loc.push_back(&e);
+
+      std::sort(by_loc.begin(), by_loc.end(),
+                [](const UniformResourceCollector::Entry* a,
+                   const UniformResourceCollector::Entry* b) {
+                  return a->id < b->id;
+                });
+
+      int start_index = -1;
+      int end_index = -1;
+      for (size_t i = 0; i < by_loc.size(); ++i) {
+        if (by_loc[i]->name == SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME) {
+          if (start_index == -1) start_index = static_cast<int>(i);
+        } else if (by_loc[i]->name ==
+                   SHADERC_EXT_SPECIAL_UNIFORM_ORDER_END_NAME) {
+          if (end_index == -1) end_index = static_cast<int>(i);
+        }
+      }
+
+      std::set<glslang::TString> special_names;
+      if (start_index != -1 && end_index != -1 && end_index > start_index) {
+        for (int i = start_index + 1; i < end_index; ++i) {
+          special_names.insert(by_loc[i]->name);
+        }
+      }
+
+      for (auto& e : collector.entries) {
+        if (e.name == SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME ||
+            e.name == SHADERC_EXT_SPECIAL_UNIFORM_ORDER_END_NAME) {
+          e.isOrderMarker = true;
+        } else if (special_names.count(e.name)) {
+          e.isSpecialOrder = true;
+        }
+      }
+    }
+
+    // Deterministic order: special-order range first, then name, then
+    // resource type as tiebreak.
     std::sort(collector.entries.begin(), collector.entries.end(),
               [this](const UniformResourceCollector::Entry& a,
                      const UniformResourceCollector::Entry& b) {
+                if (a.isSpecialOrder != b.isSpecialOrder)
+                  return a.isSpecialOrder > b.isSpecialOrder;
                 if (a.name != b.name) return a.name < b.name;
                 return getResourceType(*a.type) < getResourceType(*b.type);
               });
 
     // Pass 1: find every explicitly-declared set -> pick the catch-all.
     for (const auto& e : collector.entries) {
+      if (e.isOrderMarker) continue;
       if (e.hasSet) explicit_sets_.insert(e.set);
     }
     int candidate = 0;
@@ -399,7 +456,7 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
     // Pass 2: reserve everything with an explicit binding first (both the
     // "set+binding" and "binding only" cases), exactly as written.
     for (const auto& e : collector.entries) {
-      if (!e.hasBinding) continue;
+      if (!e.hasBinding || e.isOrderMarker) continue;
       const int set = e.hasSet ? e.set : catch_all_set_;
       const glslang::TResourceType resource = getResourceType(*e.type);
       const int resourceKey =
@@ -417,7 +474,7 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
     // Pass 3: fill "set only" / "neither" into the first free hole, in the
     // deterministic name-sorted order above.
     for (const auto& e : collector.entries) {
-      if (e.hasBinding) continue;
+      if (e.hasBinding || e.isOrderMarker) continue;
       const int set = e.hasSet ? e.set : catch_all_set_;
       const glslang::TResourceType resource = getResourceType(*e.type);
       const int resourceKey =
@@ -429,6 +486,16 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
       resolved_[e.name] = {set, binding};
       if (e.name != e.extra_name) {
         resolved_[e.extra_name] = {set, binding};
+      }
+    }
+
+    // Pass 4: the order markers are never real resources -- discard them by
+    // mapping to set/binding -1.
+    for (const auto& e : collector.entries) {
+      if (!e.isOrderMarker) continue;
+      resolved_[e.name] = {-1, -1};
+      if (e.name != e.extra_name) {
+        resolved_[e.extra_name] = {-1, -1};
       }
     }
   }
@@ -474,6 +541,39 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
   int catch_all_set_ = 0;
   std::map<glslang::TString, std::pair<int, int>> resolved_;
 };
+
+// Removes the two order-marker global uniform declarations from the
+// "linker objects" list of the linked intermediate representation, so
+// GlslangToSpv never emits OpVariable for them. This is the only reliable
+// way to fully discard them -- resolveSet/resolveBinding returning -1 only
+// suppresses their binding decoration, it doesn't stop them from being
+// emitted as (unbound) globals. Otherwise preserve bindings has to be off,
+// which removes others too.
+void RemoveSpecialOrderMarkers(glslang::TIntermediate& intermediate) {
+  TIntermNode* root = intermediate.getTreeRoot();
+  if (!root) return;
+  glslang::TIntermAggregate* rootAgg = root->getAsAggregate();
+  if (!rootAgg) return;
+
+  for (TIntermNode* node : rootAgg->getSequence()) {
+    glslang::TIntermAggregate* linkerObjs = node->getAsAggregate();
+    if (!linkerObjs || linkerObjs->getOp() != glslang::EOpLinkerObjects)
+      continue;
+
+    auto& seq = linkerObjs->getSequence();
+    seq.erase(std::remove_if(
+                  seq.begin(), seq.end(),
+                  [](TIntermNode* n) {
+                    glslang::TIntermSymbol* sym = n->getAsSymbolNode();
+                    if (!sym) return false;
+                    const glslang::TString& name = sym->getAccessName();
+                    return name ==
+                               SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME ||
+                           name == SHADERC_EXT_SPECIAL_UNIFORM_ORDER_END_NAME;
+                  }),
+              seq.end());
+  }
+}
 
 
 }  // anonymous namespace
@@ -755,6 +855,13 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   options.generateDebugInfo = generate_debug_info_;
   options.disableOptimizer = true;
   options.optimizeSize = false;
+
+   glslang::TIntermediate& linked_intermediate =
+      *program.getIntermediate(used_shader_stage);
+  // Strip the two order-marker uniforms so they never get emitted as SPIR-V
+  // globals, without disturbing bindings/preservation of anything else.
+  RemoveSpecialOrderMarkers(linked_intermediate);
+
   // Note the call to GlslangToSpv also populates compilation_output_data.
   glslang::GlslangToSpv(*program.getIntermediate(used_shader_stage), spirv,
                         &options);

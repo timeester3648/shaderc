@@ -27,6 +27,9 @@ extern "C" {
 #define SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_SET		INT_MAX
 #define SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_BINDING	INT_MAX
 
+#define SHADERC_EXT_SPECIAL_UNIFORM_ORDER_START_NAME		"_shaderc_special_uniform_order_start_"
+#define SHADERC_EXT_SPECIAL_UNIFORM_ORDER_END_NAME			"_shaderc_special_uniform_order_end_"
+
 
 #ifdef __cplusplus
 }
