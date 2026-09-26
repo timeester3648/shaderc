@@ -599,10 +599,10 @@ std::vector<std::string> BuildExplicitBindingModuleProcessedStrings(
     }
   }
 
-  // shaderc_ext_explicit_s and shaderc_ext_explicit_b only ever record a
-  // single number per entry (unlike _sb, which pairs a set with a binding),
-  // so multiple resources sharing the same lone value would otherwise show
-  // up as repeated, redundant entries. Dedupe those two buckets.
+  std::sort(both_explicit.begin(), both_explicit.end());
+  both_explicit.erase(std::unique(both_explicit.begin(), both_explicit.end()),
+                      both_explicit.end());
+
   std::sort(set_only_explicit.begin(), set_only_explicit.end());
   set_only_explicit.erase(
       std::unique(set_only_explicit.begin(), set_only_explicit.end()),
