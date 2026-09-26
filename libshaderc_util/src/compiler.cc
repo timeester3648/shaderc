@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <format>
 #include <iomanip>
 #include <map>
 #include <set>
@@ -24,7 +25,15 @@
 #include <tuple>
 #include <vector>
 
+#include "../../libshaderc/include/shaderc/shaderc_ext.h"
 #include "SPIRV/GlslangToSpv.h"
+#include "glslang/Include/Common.h"
+#include "glslang/Include/InfoSink.h"
+#include "glslang/Include/Types.h"
+#include "glslang/Include/intermediate.h"
+#include "glslang/MachineIndependent/LiveTraverser.h"
+#include "glslang/MachineIndependent/SymbolTable.h"
+#include "glslang/MachineIndependent/iomapper.h"
 #include "libshaderc_util/format.h"
 #include "libshaderc_util/io_shaderc.h"
 #include "libshaderc_util/message.h"
@@ -34,17 +43,6 @@
 #include "libshaderc_util/string_piece.h"
 #include "libshaderc_util/version_profile.h"
 #include "spirv-tools/libspirv.hpp"
-
-#include "glslang/Include/Common.h"
-#include "glslang/Include/InfoSink.h"
-#include "glslang/Include/Types.h"
-#include "glslang/Include/intermediate.h" 
-
-#include "glslang/MachineIndependent/iomapper.h"
-#include "glslang/MachineIndependent/LiveTraverser.h"
-#include "glslang/MachineIndependent/SymbolTable.h"
-
-#include "../../libshaderc/include/shaderc/shaderc_ext.h"
 
 namespace {
 using shaderc_util::string_piece;
@@ -143,7 +141,8 @@ EShMessages GetMessageRules(shaderc_util::Compiler::TargetEnv env,
 //     glslang assigns real offsets sequentially over this reordered list.
 class GlobalUniformBlockOptimizer : public glslang::TIntermTraverser {
  public:
-  explicit GlobalUniformBlockOptimizer(const glslang::TIntermediate& intermediate)
+  explicit GlobalUniformBlockOptimizer(
+      const glslang::TIntermediate& intermediate)
       : intermediate_(intermediate) {}
 
   void visitSymbol(glslang::TIntermSymbol* symbol) override {
@@ -192,14 +191,17 @@ class GlobalUniformBlockOptimizer : public glslang::TIntermTraverser {
       const int alignment = intermediate_.getBaseAlignment(
           *original[i].type, size, stride, glslang::ElpStd430,
           /*rowMajor=*/false);
-      candidates.push_back({&original[i], alignment, size, static_cast<int>(i)});
+      candidates.push_back(
+          {&original[i], alignment, size, static_cast<int>(i)});
     }
 
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) {
-                if (a.alignment != b.alignment) return a.alignment > b.alignment;
+                if (a.alignment != b.alignment)
+                  return a.alignment > b.alignment;
                 if (a.size != b.size) return a.size > b.size;
-                return a.loc->type->getFieldName() < b.loc->type->getFieldName();
+                return a.loc->type->getFieldName() <
+                       b.loc->type->getFieldName();
               });
 
     std::vector<Gap> gaps;
@@ -216,9 +218,8 @@ class GlobalUniformBlockOptimizer : public glslang::TIntermTraverser {
       int best_gap = -1;
       int best_gap_aligned_start = 0;
       for (size_t i = 0; i < gaps.size(); ++i) {
-        const int aligned_start =
-            (gaps[i].offset + field.alignment - 1) / field.alignment *
-            field.alignment;
+        const int aligned_start = (gaps[i].offset + field.alignment - 1) /
+                                  field.alignment * field.alignment;
         const int gap_end = gaps[i].offset + gaps[i].size;
         if (aligned_start + field.size > gap_end) continue;
         if (best_gap == -1 || gaps[i].size < gaps[best_gap].size) {
@@ -251,15 +252,17 @@ class GlobalUniformBlockOptimizer : public glslang::TIntermTraverser {
       placed.push_back({placement_offset, field.loc, field.original_index});
     }
 
-    std::sort(placed.begin(), placed.end(),
-              [](const Placed& a, const Placed& b) { return a.offset < b.offset; });
+    std::sort(
+        placed.begin(), placed.end(),
+        [](const Placed& a, const Placed& b) { return a.offset < b.offset; });
 
     reordered_.clear();
     reordered_.reserve(placed.size());
     old_to_new_.assign(placed.size(), -1);
     for (size_t new_index = 0; new_index < placed.size(); ++new_index) {
       reordered_.push_back(*placed[new_index].loc);
-      old_to_new_[placed[new_index].original_index] = static_cast<int>(new_index);
+      old_to_new_[placed[new_index].original_index] =
+          static_cast<int>(new_index);
     }
   }
 
@@ -286,7 +289,8 @@ class GlobalUniformBlockIndexRemapper : public glslang::TIntermTraverser {
         leftSym->getAccessName() != SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME)
       return true;
 
-    glslang::TIntermConstantUnion* idxNode = node->getRight()->getAsConstantUnion();
+    glslang::TIntermConstantUnion* idxNode =
+        node->getRight()->getAsConstantUnion();
     if (!idxNode) return true;
 
     const int old_index = idxNode->getConstArray()[0].getIConst();
@@ -466,7 +470,7 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
       const int binding = getBaseBinding(stage, resource, set) + e.binding;
       resolved_[e.name] = {set, binding};
       if (e.name != e.extra_name) {
-        resolved_[e.extra_name] = {set, binding};      
+        resolved_[e.extra_name] = {set, binding};
       }
       reserveSlot(resourceKey, set, binding, numBindings);
     }
@@ -503,6 +507,11 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
   bool validateBinding(EShLanguage, glslang::TVarEntryInfo&) override {
     return true;
   }
+
+  // The "first unused set" chosen as the catch-all destination for any
+  // resource that had no explicit `set` qualifier, when auto-bind mapping is
+  // enabled.
+  int catchAllSet() const { return catch_all_set_; }
 
   glslang::TResourceType getResourceType(const glslang::TType& type) override {
     if (isImageType(type)) return glslang::EResImage;
@@ -542,6 +551,95 @@ class ShadercAutoBindResolver : public glslang::TDefaultIoResolverBase {
   std::map<glslang::TString, std::pair<int, int>> resolved_;
 };
 
+// Builds up to 3 OpModuleProcessed strings recording, for every
+// uniform/buffer resource, whether its `set` and/or `binding` layout
+// qualifiers were written explicitly in the original source -- and if so,
+// what value(s) were given. This is purely extra provenance baked into the
+// module when debug info is requested; it has no effect on compilation or
+// on the actual set/binding resolution performed elsewhere.
+//
+// Entries are bucketed by which of {set, binding} were explicit:
+//   * both explicit  -> "shaderc_ext_explicit_sb (<set>, <binding>);..."
+//   * set only       -> "shaderc_ext_explicit_s (<set>);..."
+//   * binding only   -> "shaderc_ext_explicit_b (<binding>);..."
+// The set-only and binding-only buckets are deduplicated, since they record
+// a single bare number per entry and repeats would just be noise; the
+// set+binding pairs in the first bucket are left as-is. Buckets that have no
+// members are omitted entirely, so this produces between 0 and 3 strings.
+// (A separate, 4th OpModuleProcessed -- "shaderc_ext_auto_bind_set" -- is
+// added directly in Compile() when auto-bind mapping is enabled, since the
+// catch-all set it reports is only known once ShadercAutoBindResolver runs.)
+std::vector<std::string> BuildExplicitBindingModuleProcessedStrings(
+    const glslang::TIntermediate& intermediate) {
+  UniformResourceCollector collector;
+  if (TIntermNode* root = intermediate.getTreeRoot()) {
+    root->traverse(&collector);
+  }
+
+  // Sort by name for a result that's independent of traversal order.
+  std::sort(
+      collector.entries.begin(), collector.entries.end(),
+      [](const UniformResourceCollector::Entry& a,
+         const UniformResourceCollector::Entry& b) { return a.name < b.name; });
+
+  std::vector<std::pair<int, int>> both_explicit;
+  std::vector<int> set_only_explicit;
+  std::vector<int> binding_only_explicit;
+
+  for (const auto& e : collector.entries) {
+    // The order markers and the shaderc-generated default uniform block are
+    // never user-declared resources with explicit layout qualifiers.
+    if (e.isOrderMarker) continue;
+    if (e.hasSet && e.hasBinding) {
+      both_explicit.emplace_back(e.set, e.binding);
+    } else if (e.hasSet) {
+      set_only_explicit.push_back(e.set);
+    } else if (e.hasBinding) {
+      binding_only_explicit.push_back(e.binding);
+    }
+  }
+
+  // shaderc_ext_explicit_s and shaderc_ext_explicit_b only ever record a
+  // single number per entry (unlike _sb, which pairs a set with a binding),
+  // so multiple resources sharing the same lone value would otherwise show
+  // up as repeated, redundant entries. Dedupe those two buckets.
+  std::sort(set_only_explicit.begin(), set_only_explicit.end());
+  set_only_explicit.erase(
+      std::unique(set_only_explicit.begin(), set_only_explicit.end()),
+      set_only_explicit.end());
+
+  std::sort(binding_only_explicit.begin(), binding_only_explicit.end());
+  binding_only_explicit.erase(
+      std::unique(binding_only_explicit.begin(), binding_only_explicit.end()),
+      binding_only_explicit.end());
+
+  std::vector<std::string> result;
+
+  if (!both_explicit.empty()) {
+    std::string s = "shaderc_ext_explicit_sb ";
+    for (const auto& [set, binding] : both_explicit) {
+      s += std::format("({},{});", set, binding);
+    }
+    result.push_back(std::move(s));
+  }
+  if (!set_only_explicit.empty()) {
+    std::string s = "shaderc_ext_explicit_s ";
+    for (int set : set_only_explicit) {
+      s += std::format("({});", set);
+    }
+    result.push_back(std::move(s));
+  }
+  if (!binding_only_explicit.empty()) {
+    std::string s = "shaderc_ext_explicit_b ";
+    for (int binding : binding_only_explicit) {
+      s += std::format("({});", binding);
+    }
+    result.push_back(std::move(s));
+  }
+
+  return result;
+}
+
 // Removes the two order-marker global uniform declarations from the
 // "linker objects" list of the linked intermediate representation, so
 // GlslangToSpv never emits OpVariable for them. This is the only reliable
@@ -574,7 +672,6 @@ void RemoveSpecialOrderMarkers(glslang::TIntermediate& intermediate) {
               seq.end());
   }
 }
-
 
 }  // anonymous namespace
 
@@ -760,8 +857,9 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
 
   shader.setGlobalUniformBlockName(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_NAME);
   shader.setGlobalUniformSet(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_SET);
-  shader.setGlobalUniformBinding(SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_BINDING);
-  
+  shader.setGlobalUniformBinding(
+      SHADERC_EXT_DEFAULT_UNIFORM_BLOCK_INITIAL_BINDING);
+
   if (auto_combined_image_sampler_) {
     shader.setTextureSamplerTransformMode(
         EShTexSampTransUpgradeTextureRemoveSampler);
@@ -831,6 +929,21 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
     root->traverse(&index_remapper);
   }
 
+  // Snapshot, from the freshly-parsed (pre link/mapIO) intermediate, which
+  // resources had an explicit `set` and/or `binding` layout qualifier in the
+  // original source. This has to happen before program.mapIO() below, since
+  // that call is what assigns sets/bindings that were left implicit -- after
+  // it runs we can no longer tell "explicit" from "auto-assigned" apart.
+  // Only bothered with when debug info is requested, since that's the only
+  // place this ends up (as OpModuleProcessed strings). If auto-bind mapping
+  // ends up running below, a "shaderc_ext_auto_bind_set" entry recording its
+  // catch-all set gets appended to this same vector.
+  std::vector<std::string> explicit_binding_processes;
+  if (generate_debug_info_) {
+    explicit_binding_processes =
+        BuildExplicitBindingModuleProcessedStrings(*shader.getIntermediate());
+  }
+
   glslang::TProgram program;
   program.addShader(&shader);
   success = program.link(EShMsgDefault);
@@ -838,6 +951,10 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
     if (auto_bind_uniforms_) {
       ShadercAutoBindResolver io_resolver(*shader.getIntermediate());
       success = program.mapIO(&io_resolver);
+      if (generate_debug_info_) {
+        explicit_binding_processes.push_back(std::format(
+            "shaderc_ext_auto_bind_set ({});", io_resolver.catchAllSet()));
+      }
     } else {
       success = program.mapIO();
     }
@@ -856,11 +973,19 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
   options.disableOptimizer = true;
   options.optimizeSize = false;
 
-   glslang::TIntermediate& linked_intermediate =
+  glslang::TIntermediate& linked_intermediate =
       *program.getIntermediate(used_shader_stage);
   // Strip the two order-marker uniforms so they never get emitted as SPIR-V
   // globals, without disturbing bindings/preservation of anything else.
   RemoveSpecialOrderMarkers(linked_intermediate);
+
+  // Record, as up to 4 OpModuleProcessed instructions: every resource that
+  // had an explicit set and/or binding layout qualifier in the source
+  // (bucketed into up to 3 strings by which of the two were explicit), plus
+  // the catch-all set used for auto-bind mapping, if that was enabled.
+  if (!explicit_binding_processes.empty()) {
+    linked_intermediate.addProcesses(explicit_binding_processes);
+  }
 
   // Note the call to GlslangToSpv also populates compilation_output_data.
   glslang::GlslangToSpv(*program.getIntermediate(used_shader_stage), spirv,
